@@ -2766,6 +2766,12 @@ static token_t token_concat (c2m_ctx_t c2m_ctx, token_t t1, token_t t2) {
   set_string_stream (c2m_ctx, VARR_ADDR (char, temp_string), t1->pos, NULL);
   t = get_next_pptoken (c2m_ctx);
   next = get_next_pptoken (c2m_ctx);
+  // Sarah Burns: gcc compatibility
+  //   allow ## to not merge tokens but simply remove the ##.
+  if (next->code != T_EOU && next->code != T_EOFILE) {
+    t = NULL;
+    next = get_next_pptoken (c2m_ctx);
+  }
   while (next->code == T_EOU) next = get_next_pptoken (c2m_ctx);
   if (next->code != T_EOFILE) {
     error (c2m_ctx, t1->pos, "wrong result of ##: %s", reverse (temp_string));
@@ -2820,6 +2826,8 @@ static VARR (token_t) * do_concat (c2m_ctx_t c2m_ctx, VARR (token_t) * tokens) {
         j++;
       if (VARR_GET (token_t, tokens, k)->code == ' ' || VARR_GET (token_t, tokens, k)->code == '\n')
         k--;
+      if (k < 0) error (c2m_ctx, t->pos, "## requires token before");
+      if (j >= len) error (c2m_ctx, t->pos, "## requires token after");
       assert (k >= 0 && j < len);
       empty_j_p = VARR_GET (token_t, tokens, j)->code == T_PLM;
       empty_k_p = VARR_GET (token_t, tokens, k)->code == T_PLM;
@@ -2845,8 +2853,14 @@ static VARR (token_t) * do_concat (c2m_ctx_t c2m_ctx, VARR (token_t) * tokens) {
         }
       } else {
         t = token_concat (c2m_ctx, VARR_GET (token_t, tokens, k), VARR_GET (token_t, tokens, j));
-        del_tokens (tokens, k + 1, j - k);
-        VARR_SET (token_t, tokens, k, t);
+        // Sarah Burns: gcc compatibility
+        //   allow ## to not merge tokens but simply remove the ##.
+        if (t == NULL) {
+          del_tokens (tokens, i, 1);
+        } else {
+          del_tokens (tokens, k + 1, j - k);
+          VARR_SET (token_t, tokens, k, t);
+        }
       }
       i = k;
       len = (int) VARR_LENGTH (token_t, tokens);
