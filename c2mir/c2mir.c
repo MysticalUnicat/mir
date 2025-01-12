@@ -2741,6 +2741,11 @@ static void find_args (c2m_ctx_t c2m_ctx, macro_call_t mc) { /* we have just rea
       VARR_DESTROY (token_t, temp_arr);
     }
     error (c2m_ctx, t->pos, "too many args for call of macro %s", m->id->repr);
+  } else if (VARR_LENGTH (token_arr_t, args) == params_len - 1 && VARR_GET (token_t, m->params, params_len - 1)->code == T_DOTS) {
+    // Sarah Burns: gcc compatibility
+    //   allow ... to be filled with no tokens
+    VARR_CREATE (token_t, arg, alloc, 16);
+    VARR_PUSH (token_arr_t, args, arg);
   } else if (VARR_LENGTH (token_arr_t, args) < params_len) {
     for (; VARR_LENGTH (token_arr_t, args) < params_len;) {
       VARR_CREATE (token_t, arg, alloc, 16);
