@@ -2547,6 +2547,11 @@ static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char *
         if (file_found_p (fullname)) return uniq_cstr (c2m_ctx, fullname).s;
       }
     }
+    for (size_t i = 0; i < c2m_options->string_headers_num; i++)
+      if (c2m_options->string_headers_name[i] != NULL && strcmp (name, c2m_options->string_headers_name[i]) == 0) {
+        *content = c2m_options->string_headers_content[i];
+        return name;
+      }
     for (size_t i = 0; i < sizeof (standard_includes) / sizeof (string_include_t); i++)
       if (standard_includes[i].name != NULL && strcmp (name, standard_includes[i].name) == 0) {
         *content = standard_includes[i].content;

@@ -34,6 +34,9 @@ struct c2mir_options {
   size_t macro_commands_num, include_dirs_num;
   struct c2mir_macro_command *macro_commands;
   const char **include_dirs;
+  size_t string_headers_num;
+  const char **string_headers_name;
+  const char **string_headers_content;
 };
 
 void c2mir_init (MIR_context_t ctx);
