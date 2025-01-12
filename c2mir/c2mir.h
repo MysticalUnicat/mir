@@ -16,12 +16,20 @@ struct c2mir_macro_command {
   const char *name, *def; /* def is used only when def_p is true */
 };
 
+struct c2m_output {
+  FILE *file;
+  void (*callback)(void * user_data, const char * text, size_t length);
+  void * callback_user_data;
+};
+
+typedef struct c2m_output *c2m_output_t;
+
 struct c2mir_options {
-  FILE *message_file;
+  c2m_output_t message_output;
   int debug_p, verbose_p, ignore_warnings_p, no_prepro_p, prepro_only_p;
   int syntax_only_p, pedantic_p, asm_p, object_p;
   size_t module_num;
-  FILE *prepro_output_file; /* non-null for prepro_only_p */
+  c2m_output_t prepro_output;
   const char *output_file_name;
   size_t macro_commands_num, include_dirs_num;
   struct c2mir_macro_command *macro_commands;
@@ -31,6 +39,6 @@ struct c2mir_options {
 void c2mir_init (MIR_context_t ctx);
 void c2mir_finish (MIR_context_t ctx);
 int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *),
-                   void *getc_data, const char *source_name, FILE *output_file);
+                   void *getc_data, const char *source_name, c2m_output_t output);
 
 #endif

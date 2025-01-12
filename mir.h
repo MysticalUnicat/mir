@@ -600,6 +600,9 @@ extern void MIR_output_insn (MIR_context_t ctx, FILE *f, MIR_insn_t insn, MIR_fu
                              int newline_p);
 extern void MIR_output_item (MIR_context_t ctx, FILE *f, MIR_item_t item);
 extern void MIR_output_module (MIR_context_t ctx, FILE *f, MIR_module_t module);
+extern void MIR_output_module_with_func (MIR_context_t ctx,
+                                         int (*const writer_func) (MIR_context_t, void *, uint8_t),
+                                         void * user_data, MIR_module_t module);
 extern void MIR_output (MIR_context_t ctx, FILE *f);
 
 #if !MIR_NO_IO
@@ -607,11 +610,13 @@ extern void MIR_write (MIR_context_t ctx, FILE *f);
 extern void MIR_write_module (MIR_context_t ctx, FILE *f, MIR_module_t module);
 extern void MIR_read (MIR_context_t ctx, FILE *f);
 extern void MIR_write_with_func (MIR_context_t ctx,
-                                 int (*const writer_func) (MIR_context_t, uint8_t));
+                                 int (*const writer_func) (MIR_context_t, void *, uint8_t),
+                                 void * user_data);
 extern void MIR_write_module_with_func (MIR_context_t ctx,
-                                        int (*const writer_func) (MIR_context_t, uint8_t),
+                                        int (*const writer_func) (MIR_context_t, void *, uint8_t),
+                                        void * user_data,
                                         MIR_module_t module);
-extern void MIR_read_with_func (MIR_context_t ctx, int (*const reader_func) (MIR_context_t));
+extern void MIR_read_with_func (MIR_context_t ctx, int (*const reader_func) (MIR_context_t, void *), void * user_data);
 #endif
 
 #if !MIR_NO_SCAN

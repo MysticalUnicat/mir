@@ -4583,8 +4583,10 @@ DEF_VARR (MIR_label_t);
 
 struct io_ctx {
   FILE *io_file;
-  int (*io_writer) (MIR_context_t, uint8_t);
-  int (*io_reader) (MIR_context_t);
+  int (*io_writer) (MIR_context_t, void *, uint8_t);
+  void *io_writer_user_data;
+  int (*io_reader) (MIR_context_t, void *);
+  void *io_reader_user_data;
   struct reduce_data *io_reduce_data;
   VARR (MIR_var_t) * proto_vars;
   VARR (MIR_type_t) * proto_types;
@@ -4600,7 +4602,9 @@ struct io_ctx {
 
 #define io_file ctx->io_ctx->io_file
 #define io_writer ctx->io_ctx->io_writer
+#define io_writer_user_data ctx->io_ctx->io_writer_user_data
 #define io_reader ctx->io_ctx->io_reader
+#define io_reader_user_data ctx->io_ctx->io_reader_user_data
 #define io_reduce_data ctx->io_ctx->io_reduce_data
 #define proto_vars ctx->io_ctx->proto_vars
 #define proto_types ctx->io_ctx->proto_types
@@ -5070,12 +5074,12 @@ static size_t reduce_writer (const void *start, size_t len, void *aux_data) {
   size_t i, n = 0;
 
   for (i = n = 0; i < len; i++, n++)
-    if (io_writer (ctx, ((uint8_t *) start)[i]) == EOF) break;
+    if (io_writer (ctx, io_writer_user_data, ((uint8_t *) start)[i]) == EOF) break;
   return n;
 }
 
-void MIR_write_module_with_func (MIR_context_t ctx, int (*const writer) (MIR_context_t, uint8_t),
-                                 MIR_module_t module) {
+void MIR_write_module_with_func (MIR_context_t ctx, int (*const writer) (MIR_context_t, void *, uint8_t),
+                                 void * user_data, MIR_module_t module) {
   size_t MIR_UNUSED len;
   size_t str_len;
 
@@ -5116,15 +5120,15 @@ void MIR_write_module_with_func (MIR_context_t ctx, int (*const writer) (MIR_con
 #endif
 }
 
-void MIR_write_with_func (MIR_context_t ctx, int (*const writer) (MIR_context_t, uint8_t)) {
-  MIR_write_module_with_func (ctx, writer, NULL);
+void MIR_write_with_func (MIR_context_t ctx, int (*const writer) (MIR_context_t, void *, uint8_t), void *user_data) {
+  MIR_write_module_with_func (ctx, writer, user_data, NULL);
 }
 
-static int file_writer (MIR_context_t ctx, uint8_t byte) { return fputc (byte, io_file); }
+static int file_writer (MIR_context_t ctx, void * user_data, uint8_t byte) { return fputc (byte, io_file); }
 
 void MIR_write_module (MIR_context_t ctx, FILE *f, MIR_module_t module) {
   io_file = f;
-  MIR_write_module_with_func (ctx, file_writer, module);
+  MIR_write_module_with_func (ctx, file_writer, NULL, module);
 }
 
 void MIR_write (MIR_context_t ctx, FILE *f) { MIR_write_module (ctx, f, NULL); }
@@ -5469,12 +5473,12 @@ static size_t reduce_reader (void *start, size_t len, void *data) {
   size_t i;
   int c;
 
-  for (i = 0; i < len && (c = io_reader (ctx)) != EOF; i++) ((char *) start)[i] = c;
+  for (i = 0; i < len && (c = io_reader (ctx, io_reader_user_data)) != EOF; i++) ((char *) start)[i] = c;
   return i;
 }
 #endif
 
-void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t)) {
+void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t, void *), void * user_data) {
   int version, global_p, nlref_p;
   bin_tag_t tag, type_tag;
   token_attr_t attr;
@@ -5488,6 +5492,7 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
   MIR_item_t func, item;
 
   io_reader = reader;
+  io_reader_user_data = user_data;
 #ifndef MIR_NO_BIN_COMPRESSION
   if ((io_reduce_data = reduce_decode_start (ctx->alloc, reduce_reader, ctx)) == NULL)
     MIR_get_error_func (ctx) (MIR_binary_io_error,
@@ -5794,18 +5799,18 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
     MIR_get_error_func (ctx) (MIR_binary_io_error, "unfinished func %s", func->u.func->name);
   if (module != NULL)
     MIR_get_error_func (ctx) (MIR_binary_io_error, "unfinished module %s", module->name);
-  if (reader (ctx) != EOF)
+  if (reader (ctx, user_data) != EOF)
     MIR_get_error_func (ctx) (MIR_binary_io_error, "garbage at the end of file");
 #ifndef MIR_NO_BIN_COMPRESSION
   reduce_decode_finish (ctx->alloc, io_reduce_data);
 #endif
 }
 
-static int file_reader (MIR_context_t ctx) { return fgetc (io_file); }
+static int file_reader (MIR_context_t ctx, void * user_data) { return fgetc (io_file); }
 
 void MIR_read (MIR_context_t ctx, FILE *f) {
   io_file = f;
-  MIR_read_with_func (ctx, file_reader);
+  MIR_read_with_func (ctx, file_reader, NULL);
 }
 
 static void io_init (MIR_context_t ctx) {

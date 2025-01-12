@@ -157,7 +157,7 @@ struct c2m_ctx {
   int (*c_getc) (void *); /* c2mir interface get function */
   void *c_getc_data;
   unsigned n_errors, n_warnings;
-  VARR (char) * symbol_text, *temp_string;
+  VARR (char) * symbol_text, *temp_string, *temp_message_text;
   VARR (token_t) * recorded_tokens, *buffered_tokens;
   node_t top_scope;
   HTAB (symbol_t) * symbol_tab;
@@ -194,6 +194,7 @@ typedef struct c2m_ctx *c2m_ctx_t;
 #define n_warnings c2m_ctx->n_warnings
 #define symbol_text c2m_ctx->symbol_text
 #define temp_string c2m_ctx->temp_string
+#define temp_message_text c2m_ctx->temp_message_text
 #define recorded_tokens c2m_ctx->recorded_tokens
 #define buffered_tokens c2m_ctx->buffered_tokens
 #define top_scope c2m_ctx->top_scope
@@ -855,10 +856,64 @@ static token_t new_node_token (c2m_ctx_t c2m_ctx, pos_t pos, const char *repr, i
   return token;
 }
 
-static void print_pos (FILE *f, pos_t pos, int col_p) {
+static int output_putc(c2m_ctx_t c2m_ctx, c2m_output_t output, uint8_t byte) {
+  void (*callback)(void *, const char *, size_t);
+  FILE *f;
+  if ((f = output->file) != NULL) {
+    fputc(byte, f);
+  } else if ((callback = output->callback) != NULL) {
+    callback(output->callback_user_data, &byte, 1);
+  }
+}
+
+static void output_print(c2m_ctx_t c2m_ctx, c2m_output_t output, const char * text) {
+  void (*callback)(void *, const char *, size_t);
+  FILE *f;
+  if ((f = output->file) != NULL) {
+    fprintf(f, "%s", text);
+  } else if ((callback = output->callback) != NULL) {
+    callback(output->callback_user_data, text, strlen(text));
+  }
+}
+
+static void output_vprintf(c2m_ctx_t c2m_ctx, c2m_output_t output, const char * format, va_list ap) {
+  void (*callback)(void *, const char *, size_t);
+  FILE *f;
+  if ((f = output->file) != NULL) {
+    vfprintf(f, format, ap);
+  } else if ((callback = output->callback) != NULL) {
+    va_list ap2;
+    va_copy (ap2, ap);
+    int size = vsnprintf (NULL, 0, format, ap2);
+    va_end (ap2);
+
+    if (size <= 0) return;
+
+    VARR_EXPAND (char, temp_message_text, size);
+    
+    vsnprintf (VARR_ADDR (char, temp_message_text), VARR_CAPACITY (char, temp_message_text), format, ap);
+    callback (output->callback_user_data, VARR_ADDR (char, temp_message_text), size);
+  }
+}
+
+static void output_printf(c2m_ctx_t c2m_ctx, c2m_output_t output, const char * format, ...) {
+  FILE *f;
+  va_list ap;
+  if ((f = output->file) != NULL) {
+    va_start (ap, format);
+    vfprintf (f, format, ap);
+    va_end (ap);
+  } else if (output->callback != NULL) {
+    va_start (ap, format);
+    output_vprintf (c2m_ctx, output, format, ap);
+    va_end (ap);
+  }
+}
+
+static void print_pos (c2m_ctx_t c2m_ctx, c2m_output_t output, pos_t pos, int col_p) {
   if (pos.lno < 0) return;
-  fprintf (f, "%s:%d", pos.fname, pos.lno);
-  if (col_p) fprintf (f, ":%d: ", pos.ln_pos);
+  output_printf (c2m_ctx, output, "%s:%d", pos.fname, pos.lno);
+  if (col_p) output_printf (c2m_ctx, output, ":%d: ", pos.ln_pos);
 }
 
 static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
@@ -893,30 +948,30 @@ static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
 
 static void error (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   va_list args;
-  FILE *f;
+  c2m_output_t o;
 
-  if ((f = c2m_options->message_file) == NULL) return;
+  if ((o = c2m_options->message_output) == NULL) return;
   n_errors++;
   va_start (args, format);
-  print_pos (f, pos, TRUE);
-  vfprintf (f, format, args);
+  print_pos (c2m_ctx, o, pos, TRUE);
+  output_vprintf (c2m_ctx, o, format, args);
   va_end (args);
-  fprintf (f, "\n");
+  output_print (c2m_ctx, o, "\n");
 }
 
 static void warning (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   va_list args;
-  FILE *f;
+  c2m_output_t o;
 
-  if ((f = c2m_options->message_file) == NULL) return;
+  if ((o = c2m_options->message_output) == NULL) return;
   n_warnings++;
   if (!c2m_options->ignore_warnings_p) {
     va_start (args, format);
-    print_pos (f, pos, TRUE);
-    fprintf (f, "warning -- ");
-    vfprintf (f, format, args);
+    print_pos (c2m_ctx, o, pos, TRUE);
+    output_printf (c2m_ctx, o, "warning -- ");
+    output_vprintf (c2m_ctx, o, format, args);
     va_end (args);
-    fprintf (f, "\n");
+    output_printf (c2m_ctx, o, "\n");
   }
 }
 
@@ -1577,8 +1632,8 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
       cs = VARR_LAST (stream_t, streams);
       if (cs->f == NULL && cs->fname != NULL && !string_stream_p (cs)) {
         if ((cs->f = fopen (cs->fname, "rb")) == NULL) {
-          if (c2m_options->message_file != NULL)
-            fprintf (c2m_options->message_file, "cannot reopen file %s -- good bye\n", cs->fname);
+          if (c2m_options->message_output != NULL)
+            output_printf (c2m_ctx, c2m_options->message_output, "cannot reopen file %s -- good bye\n", cs->fname);
           longjmp (c2m_ctx->env, 1);  // ???
         }
         fsetpos (cs->f, &cs->fpos);
@@ -1948,8 +2003,8 @@ static token_t pptoken2token (c2m_ctx_t c2m_ctx, token_t t, int id2kw_p) {
         = get_int_node_from_repr (c2m_ctx, start, &stop, base, uns_p, long_p, llong_p, t->pos);
     }
     if (stop != &repr[last + 1]) {
-      if (c2m_options->message_file != NULL)
-        fprintf (c2m_options->message_file, "%s:%s:%s\n", repr, stop, &repr[last + 1]);
+      if (c2m_options->message_output != NULL)
+        output_printf (c2m_ctx, c2m_options->message_output, "%s:%s:%s\n", repr, stop, &repr[last + 1]);
       error (c2m_ctx, t->pos, "wrong number: %s", t->repr);
     } else if (errno) {
       if (float_p || double_p || ldouble_p) {
@@ -2224,7 +2279,7 @@ static void add_include_stream (c2m_ctx_t c2m_ctx, const char *fname, const char
     if (strcmp (fname, VARR_GET (char_ptr_t, once_include_files, i)) == 0) return;
   assert (fname != NULL);
   if (content == NULL && (f = fopen (fname, "rb")) == NULL) {
-    if (c2m_options->message_file != NULL)
+    if (c2m_options->message_output != NULL)
       error (c2m_ctx, err_pos, "error in opening file %s", fname);
     longjmp (c2m_ctx->env, 1);  // ???
   }
@@ -3789,10 +3844,10 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
 static void pre_text_out (c2m_ctx_t c2m_ctx, token_t t) { /* NULL means end of output */
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
   int i;
-  FILE *f = c2m_options->prepro_output_file;
+  c2m_output_t o = c2m_options->prepro_output;
 
   if (t == NULL && pre_last_token != NULL && pre_last_token->code == '\n') {
-    fprintf (f, "\n");
+    output_print (c2m_ctx, o, "\n");
     return;
   }
   if (t->code == '\n') {
@@ -3802,21 +3857,21 @@ static void pre_text_out (c2m_ctx_t c2m_ctx, token_t t) { /* NULL means end of o
   if (actual_pre_pos.fname != t->pos.fname || actual_pre_pos.lno != t->pos.lno) {
     if (actual_pre_pos.fname == t->pos.fname && actual_pre_pos.lno < t->pos.lno
         && actual_pre_pos.lno + 4 >= t->pos.lno) {
-      for (; actual_pre_pos.lno != t->pos.lno; actual_pre_pos.lno++) fprintf (f, "\n");
+      for (; actual_pre_pos.lno != t->pos.lno; actual_pre_pos.lno++) output_print (c2m_ctx, o, "\n");
     } else {
-      if (pre_last_token != NULL) fprintf (f, "\n");
-      fprintf (f, "#line %d", t->pos.lno);
+      if (pre_last_token != NULL) output_print (c2m_ctx, o, "\n");
+      output_printf (c2m_ctx, o, "#line %d", t->pos.lno);
       if (actual_pre_pos.fname != t->pos.fname) {
         stringify (t->pos.fname, temp_string);
         VARR_PUSH (char, temp_string, '\0');
-        fprintf (f, " %s", VARR_ADDR (char, temp_string));
+        output_printf (c2m_ctx, o, " %s", VARR_ADDR (char, temp_string));
       }
-      fprintf (f, "\n");
+      output_print (c2m_ctx, o, "\n");
     }
-    for (i = 0; i < t->pos.ln_pos - 1; i++) fprintf (f, " ");
+    for (i = 0; i < t->pos.ln_pos - 1; i++) output_print (c2m_ctx, o, " ");
     actual_pre_pos = t->pos;
   }
-  fprintf (f, "%s", t->code == ' ' ? " " : t->repr);
+  output_print (c2m_ctx, o, t->code == ' ' ? " " : t->repr);
   pre_last_token = t;
 }
 
@@ -3908,8 +3963,8 @@ static void pre (c2m_ctx_t c2m_ctx) {
     }
   }
   pre_out_token_func (c2m_ctx, NULL);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "    preprocessor tokens -- %lu, parse tokens -- %lu\n",
+  if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+    output_printf (c2m_ctx, c2m_options->message_output, "    preprocessor tokens -- %lu, parse tokens -- %lu\n",
              pptokens_num, (unsigned long) VARR_LENGTH (token_t, recorded_tokens));
 }
 
@@ -3968,12 +4023,11 @@ static void record_stop (c2m_ctx_t c2m_ctx, size_t mark, int restore_p) {
 static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
-  FILE *f;
-
-  if ((f = c2m_options->message_file) == NULL) return;
-  print_pos (f, curr_token->pos, TRUE);
-  fprintf (f, "syntax error on %s", get_token_name (c2m_ctx, curr_token->code));
-  fprintf (f, " (expected '%s'):", expected_name);
+  c2m_output_t o;
+  if ((o = c2m_options->message_output) == NULL) return;
+  print_pos (c2m_ctx, o, curr_token->pos, TRUE);
+  output_printf (c2m_ctx, o, "syntax error on %s", get_token_name (c2m_ctx, curr_token->code));
+  output_printf (c2m_ctx, o, " (expected '%s'):", expected_name);
 #if 0
   {
     static const int context_len = 5;
@@ -3983,7 +4037,7 @@ static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
     }
   }
 #endif
-  fprintf (f, "\n");
+  output_print (c2m_ctx, o, "\n");
   n_errors++;
 }
 
@@ -5424,7 +5478,7 @@ D (transl_unit) {
 }
 
 static void fatal_error (c2m_ctx_t c2m_ctx, C_error_code_t code MIR_UNUSED, const char *message) {
-  if (c2m_options->message_file != NULL) fprintf (c2m_options->message_file, "%s\n", message);
+  if (c2m_options->message_output != NULL) output_printf (c2m_ctx, c2m_options->message_output, "%s\n", message);
   longjmp (c2m_ctx->env, 1);
 }
 
@@ -7944,9 +7998,9 @@ static void create_decl (c2m_ctx_t c2m_ctx, node_t scope, node_t decl_node,
       def_symbol (c2m_ctx, S_REGULAR, id, top_scope, decl_node, N_EXTERN);
     if (func_p && decl->decl_spec.thread_local_p) {
       error (c2m_ctx, POS (id), "thread local function declaration");
-      if (c2m_options->message_file != NULL) {
-        if (id->code != N_IGNORE) fprintf (c2m_options->message_file, " of %s", id->u.s.s);
-        fprintf (c2m_options->message_file, "\n");
+      if (c2m_options->message_output != NULL) {
+        if (id->code != N_IGNORE) output_printf (c2m_ctx, c2m_options->message_output, " of %s", id->u.s.s);
+        output_printf (c2m_ctx, c2m_options->message_output, "\n");
       }
     }
   }
@@ -13640,204 +13694,209 @@ static const char *get_node_name (node_code_t code) {
 #undef REP_SEP
 }
 
-static void print_char (FILE *f, mir_ulong ch) {
+static void print_char (c2m_ctx_t c2m_ctx, c2m_output_t o, mir_ulong ch) {
   if (ch >= 0x100) {
-    fprintf (f, ch <= 0xFFFF ? "\\u%04x" : "\\U%08x", (unsigned int) ch);
+    output_printf (c2m_ctx, o, ch <= 0xFFFF ? "\\u%04x" : "\\U%08x", (unsigned int) ch);
   } else {
-    if (ch == '"' || ch == '\"' || ch == '\\') fprintf (f, "\\");
+    if (ch == '"' || ch == '\"' || ch == '\\') output_print (c2m_ctx, o, "\\");
     if (isprint (ch))
-      fprintf (f, "%c", (unsigned int) ch);
+      output_printf (c2m_ctx, o, "%c", (unsigned int) ch);
     else
-      fprintf (f, "\\%o", (unsigned int) ch);
+      output_printf (c2m_ctx, o, "\\%o", (unsigned int) ch);
   }
 }
 
-static void print_chars (FILE *f, const char *str, size_t len) {
-  for (size_t i = 0; i < len; i++) print_char (f, str[i]);
+static void print_chars (c2m_ctx_t c2m_ctx, c2m_output_t o, const char *str, size_t len) {
+  for (size_t i = 0; i < len; i++) print_char (c2m_ctx, o, str[i]);
 }
 
-static void print_chars16 (FILE *f, const char *str, size_t len) {
-  for (size_t i = 0; i < len; i += 2) print_char (f, ((mir_char16 *) str)[i]);
+static void print_chars16 (c2m_ctx_t c2m_ctx, c2m_output_t o, const char *str, size_t len) {
+  for (size_t i = 0; i < len; i += 2) print_char (c2m_ctx, o, ((mir_char16 *) str)[i]);
 }
 
-static void print_chars32 (FILE *f, const char *str, size_t len) {
-  for (size_t i = 0; i < len; i += 4) print_char (f, ((mir_char32 *) str)[i]);
+static void print_chars32 (c2m_ctx_t c2m_ctx, c2m_output_t o, const char *str, size_t len) {
+  for (size_t i = 0; i < len; i += 4) print_char (c2m_ctx, o, ((mir_char32 *) str)[i]);
 }
 
-static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int attr_p);
+static void print_node (c2m_ctx_t c2m_ctx, c2m_output_t o, node_t n, int indent, int attr_p);
 
-void debug_node (c2m_ctx_t c2m_ctx, node_t n) { print_node (c2m_ctx, stderr, n, 0, TRUE); }
+void debug_node (c2m_ctx_t c2m_ctx, node_t n) {
+  struct c2m_output _stderr;
+  _stderr.file = stderr;
+  _stderr.callback = NULL;
+  print_node (c2m_ctx, &_stderr, n, 0, TRUE);
+}
 
-static void print_ops (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int attr_p) {
+static void print_ops (c2m_ctx_t c2m_ctx, c2m_output_t o, node_t n, int indent, int attr_p) {
   int i;
   node_t op;
 
-  for (i = 0; (op = get_op (n, i)) != NULL; i++) print_node (c2m_ctx, f, op, indent + 2, attr_p);
+  for (i = 0; (op = get_op (n, i)) != NULL; i++) print_node (c2m_ctx, o, op, indent + 2, attr_p);
 }
 
-static void print_qual (FILE *f, struct type_qual type_qual) {
-  if (type_qual.const_p) fprintf (f, ", const");
-  if (type_qual.restrict_p) fprintf (f, ", restrict");
-  if (type_qual.volatile_p) fprintf (f, ", volatile");
-  if (type_qual.atomic_p) fprintf (f, ", atomic");
+static void print_qual (c2m_ctx_t c2m_ctx, c2m_output_t o, struct type_qual type_qual) {
+  if (type_qual.const_p)  output_print (c2m_ctx, o, ", const");
+  if (type_qual.restrict_p) output_print (c2m_ctx, o, ", restrict");
+  if (type_qual.volatile_p) output_print (c2m_ctx, o, ", volatile");
+  if (type_qual.atomic_p) output_print (c2m_ctx, o, ", atomic");
 }
 
-static void print_basic_type (FILE *f, enum basic_type basic_type) {
+static void print_basic_type (c2m_ctx_t c2m_ctx, c2m_output_t o, enum basic_type basic_type) {
   switch (basic_type) {
-  case TP_UNDEF: fprintf (f, "undef type"); break;
-  case TP_VOID: fprintf (f, "void"); break;
-  case TP_BOOL: fprintf (f, "bool"); break;
-  case TP_CHAR: fprintf (f, "char"); break;
-  case TP_SCHAR: fprintf (f, "signed char"); break;
-  case TP_UCHAR: fprintf (f, "unsigned char"); break;
-  case TP_SHORT: fprintf (f, "short"); break;
-  case TP_USHORT: fprintf (f, "unsigned short"); break;
-  case TP_INT: fprintf (f, "int"); break;
-  case TP_UINT: fprintf (f, "unsigned int"); break;
-  case TP_LONG: fprintf (f, "long"); break;
-  case TP_ULONG: fprintf (f, "unsigned long"); break;
-  case TP_LLONG: fprintf (f, "long long"); break;
-  case TP_ULLONG: fprintf (f, "unsigned long long"); break;
-  case TP_FLOAT: fprintf (f, "float"); break;
-  case TP_DOUBLE: fprintf (f, "double"); break;
-  case TP_LDOUBLE: fprintf (f, "long double"); break;
+  case TP_UNDEF: output_print (c2m_ctx, o, "undef type"); break;
+  case TP_VOID: output_print (c2m_ctx, o, "void"); break;
+  case TP_BOOL: output_print (c2m_ctx, o, "bool"); break;
+  case TP_CHAR: output_print (c2m_ctx, o, "char"); break;
+  case TP_SCHAR: output_print (c2m_ctx, o, "signed char"); break;
+  case TP_UCHAR: output_print (c2m_ctx, o, "unsigned char"); break;
+  case TP_SHORT: output_print (c2m_ctx, o, "short"); break;
+  case TP_USHORT: output_print (c2m_ctx, o, "unsigned short"); break;
+  case TP_INT: output_print (c2m_ctx, o, "int"); break;
+  case TP_UINT: output_print (c2m_ctx, o, "unsigned int"); break;
+  case TP_LONG: output_print (c2m_ctx, o, "long"); break;
+  case TP_ULONG: output_print (c2m_ctx, o, "unsigned long"); break;
+  case TP_LLONG: output_print (c2m_ctx, o, "long long"); break;
+  case TP_ULLONG: output_print (c2m_ctx, o, "unsigned long long"); break;
+  case TP_FLOAT: output_print (c2m_ctx, o, "float"); break;
+  case TP_DOUBLE: output_print (c2m_ctx, o, "double"); break;
+  case TP_LDOUBLE: output_print (c2m_ctx, o, "long double"); break;
   default: assert (FALSE);
   }
 }
-static void print_type (c2m_ctx_t c2m_ctx, FILE *f, struct type *type) {
+static void print_type (c2m_ctx_t c2m_ctx, c2m_output_t o, struct type *type) {
   switch (type->mode) {
-  case TM_UNDEF: fprintf (f, "undef type mode"); break;
-  case TM_BASIC: print_basic_type (f, type->u.basic_type); break;
-  case TM_ENUM: fprintf (f, "enum node %u", type->u.tag_type->uid); break;
+  case TM_UNDEF: output_print (c2m_ctx, o, "undef type mode"); break;
+  case TM_BASIC: print_basic_type (c2m_ctx, o, type->u.basic_type); break;
+  case TM_ENUM: output_printf (c2m_ctx, o, "enum node %u", type->u.tag_type->uid); break;
   case TM_PTR:
-    fprintf (f, "ptr (");
-    print_type (c2m_ctx, f, type->u.ptr_type);
-    fprintf (f, ")");
+    output_print (c2m_ctx, o, "ptr (");
+    print_type (c2m_ctx, o, type->u.ptr_type);
+    output_print (c2m_ctx, o, ")");
     if (type->arr_type != NULL) {
-      fprintf (f, ", former ");
-      print_type (c2m_ctx, f, type->arr_type);
+      output_print (c2m_ctx, o, ", former ");
+      print_type (c2m_ctx, o, type->arr_type);
     }
-    if (type->func_type_before_adjustment_p) fprintf (f, ", former func");
+    if (type->func_type_before_adjustment_p) output_print (c2m_ctx, o, ", former func");
     break;
-  case TM_STRUCT: fprintf (f, "struct node %u", type->u.tag_type->uid); break;
-  case TM_UNION: fprintf (f, "union node %u", type->u.tag_type->uid); break;
+  case TM_STRUCT: output_printf (c2m_ctx, o, "struct node %u", type->u.tag_type->uid); break;
+  case TM_UNION: output_printf (c2m_ctx, o, "union node %u", type->u.tag_type->uid); break;
   case TM_ARR:
-    fprintf (f, "array [%s", type->u.arr_type->static_p ? "static " : "");
-    print_qual (f, type->u.arr_type->ind_type_qual);
-    fprintf (f, "size node %u] (", type->u.arr_type->size->uid);
-    print_type (c2m_ctx, f, type->u.arr_type->el_type);
-    fprintf (f, ")");
+    output_print (c2m_ctx, o, type->u.arr_type->static_p ? "array [static " : "array [");
+    print_qual (c2m_ctx, o, type->u.arr_type->ind_type_qual);
+    output_printf (c2m_ctx, o, "size node %u] (", type->u.arr_type->size->uid);
+    print_type (c2m_ctx, o, type->u.arr_type->el_type);
+    output_print (c2m_ctx, o, ")");
     break;
   case TM_FUNC:
-    fprintf (f, "func ");
-    print_type (c2m_ctx, f, type->u.func_type->ret_type);
-    fprintf (f, "(params node %u", type->u.func_type->param_list->uid);
-    fprintf (f, type->u.func_type->dots_p ? ", ...)" : ")");
+    output_print (c2m_ctx, o, "func ");
+    print_type (c2m_ctx, o, type->u.func_type->ret_type);
+    output_printf (c2m_ctx, o, "(params node %u", type->u.func_type->param_list->uid);
+    output_print (c2m_ctx, o, type->u.func_type->dots_p ? ", ...)" : ")");
     break;
   default: assert (FALSE);
   }
-  print_qual (f, type->type_qual);
-  if (incomplete_type_p (c2m_ctx, type)) fprintf (f, ", incomplete");
+  print_qual (c2m_ctx, o, type->type_qual);
+  if (incomplete_type_p (c2m_ctx, type)) output_print (c2m_ctx, o, ", incomplete");
   if (type->raw_size != MIR_SIZE_MAX)
-    fprintf (f, ", raw size = %llu", (unsigned long long) type->raw_size);
-  if (type->align >= 0) fprintf (f, ", align = %d", type->align);
-  fprintf (f, " ");
+    output_printf (c2m_ctx, o, ", raw size = %llu", (unsigned long long) type->raw_size);
+  if (type->align >= 0) output_printf (c2m_ctx, o, ", align = %d", type->align);
+  output_print (c2m_ctx, o, " ");
 }
 
-static void print_decl_spec (c2m_ctx_t c2m_ctx, FILE *f, struct decl_spec *decl_spec) {
-  if (decl_spec->typedef_p) fprintf (f, " typedef, ");
-  if (decl_spec->extern_p) fprintf (f, " extern, ");
-  if (decl_spec->static_p) fprintf (f, " static, ");
-  if (decl_spec->auto_p) fprintf (f, " auto, ");
-  if (decl_spec->register_p) fprintf (f, " register, ");
-  if (decl_spec->thread_local_p) fprintf (f, " thread local, ");
-  if (decl_spec->inline_p) fprintf (f, " inline, ");
-  if (decl_spec->no_return_p) fprintf (f, " no return, ");
-  if (decl_spec->align >= 0) fprintf (f, " align = %d, ", decl_spec->align);
+static void print_decl_spec (c2m_ctx_t c2m_ctx, c2m_output_t o, struct decl_spec *decl_spec) {
+  if (decl_spec->typedef_p) output_print (c2m_ctx, o, " typedef, ");
+  if (decl_spec->extern_p) output_print (c2m_ctx, o, " extern, ");
+  if (decl_spec->static_p) output_print (c2m_ctx, o, " static, ");
+  if (decl_spec->auto_p) output_print (c2m_ctx, o, " auto, ");
+  if (decl_spec->register_p) output_print (c2m_ctx, o, " register, ");
+  if (decl_spec->thread_local_p) output_print (c2m_ctx, o, " thread local, ");
+  if (decl_spec->inline_p) output_print (c2m_ctx, o, " inline, ");
+  if (decl_spec->no_return_p) output_print (c2m_ctx, o, " no return, ");
+  if (decl_spec->align >= 0) output_printf (c2m_ctx, o, " align = %d, ", decl_spec->align);
   if (decl_spec->align_node != NULL)
-    fprintf (f, " strictest align node %u, ", decl_spec->align_node->uid);
+    output_printf (c2m_ctx, o, " strictest align node %u, ", decl_spec->align_node->uid);
   if (decl_spec->linkage != N_IGNORE)
-    fprintf (f, " %s linkage, ", decl_spec->linkage == N_STATIC ? "static" : "extern");
-  print_type (c2m_ctx, f, decl_spec->type);
+    output_print (c2m_ctx, o, decl_spec->linkage == N_STATIC ? "static linkage" : "extern linkage");
+  print_type (c2m_ctx, o, decl_spec->type);
 }
 
-static void print_decl (c2m_ctx_t c2m_ctx, FILE *f, decl_t decl) {
+static void print_decl (c2m_ctx_t c2m_ctx, c2m_output_t o, decl_t decl) {
   if (decl == NULL) return;
-  fprintf (f, ": ");
-  if (decl->scope != NULL) fprintf (f, "scope node = %u, ", decl->scope->uid);
-  print_decl_spec (c2m_ctx, f, &decl->decl_spec);
-  if (decl->addr_p) fprintf (f, ", addressable");
-  if (decl->used_p) fprintf (f, ", used");
+  output_print (c2m_ctx, o, ": ");
+  if (decl->scope != NULL) output_printf (c2m_ctx, o, "scope node = %u, ", decl->scope->uid);
+  print_decl_spec (c2m_ctx, o, &decl->decl_spec);
+  if (decl->addr_p) output_print (c2m_ctx, o, ", addressable");
+  if (decl->used_p) output_print (c2m_ctx, o, ", used");
   if (decl->reg_p)
-    fprintf (f, ", reg");
+    output_print (c2m_ctx, o, ", reg");
   else {
-    fprintf (f, ", offset = %llu", (unsigned long long) decl->offset);
-    if (decl->bit_offset >= 0) fprintf (f, ", bit offset = %d", decl->bit_offset);
+    output_printf (c2m_ctx, o, ", offset = %llu", (unsigned long long) decl->offset);
+    if (decl->bit_offset >= 0) output_printf (c2m_ctx, o, ", bit offset = %d", decl->bit_offset);
   }
-  if (decl->asm_p) fprintf (f, ", asm=%s", decl->u.asm_str);
+  if (decl->asm_p) output_printf (c2m_ctx, o, ", asm=%s", decl->u.asm_str);
 }
 
-static void print_expr (c2m_ctx_t c2m_ctx, FILE *f, struct expr *e) {
+static void print_expr (c2m_ctx_t c2m_ctx, c2m_output_t o, struct expr *e) {
   if (e == NULL) return; /* e.g. N_ID which is not an expr */
-  fprintf (f, ": ");
-  if (e->u.lvalue_node) fprintf (f, "lvalue, ");
-  print_type (c2m_ctx, f, e->type);
+  output_print (c2m_ctx, o, ": ");
+  if (e->u.lvalue_node) output_print (c2m_ctx, o, "lvalue, ");
+  print_type (c2m_ctx, o, e->type);
   if (e->const_p) {
-    fprintf (f, ", const = ");
+    output_print (c2m_ctx, o, ", const = ");
     if (!integer_type_p (e->type)) {
-      fprintf (f, " %.*Lg\n", LDBL_MANT_DIG, (long double) e->c.d_val);
+      output_printf (c2m_ctx, o, " %.*Lg\n", LDBL_MANT_DIG, (long double) e->c.d_val);
     } else if (signed_integer_type_p (e->type)) {
-      fprintf (f, "%lld", (long long) e->c.i_val);
+      output_printf (c2m_ctx, o, "%lld", (long long) e->c.i_val);
     } else {
-      fprintf (f, "%llu", (unsigned long long) e->c.u_val);
+      output_printf (c2m_ctx, o, "%llu", (unsigned long long) e->c.u_val);
     }
   }
 }
 
-static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int attr_p) {
+static void print_node (c2m_ctx_t c2m_ctx, c2m_output_t o, node_t n, int indent, int attr_p) {
   int i;
 
-  fprintf (f, "%6u: ", n->uid);
-  for (i = 0; i < indent; i++) fprintf (f, " ");
+  output_printf (c2m_ctx, o, "%6u: ", n->uid);
+  for (i = 0; i < indent; i++) output_printf (c2m_ctx, o, " ");
   if (n == err_node) {
-    fprintf (f, "<error>\n");
+    output_printf (c2m_ctx, o, "<error>\n");
     return;
   }
-  fprintf (f, "%s (", get_node_name (n->code));
-  print_pos (f, POS (n), FALSE);
-  fprintf (f, ")");
+  output_printf (c2m_ctx, o, "%s (", get_node_name (n->code));
+  print_pos (c2m_ctx, o, POS (n), FALSE);
+  output_printf (c2m_ctx, o, ")");
   switch (n->code) {
-  case N_IGNORE: fprintf (f, "\n"); break;
-  case N_I: fprintf (f, " %lld", (long long) n->u.l); goto expr;
-  case N_L: fprintf (f, " %lldl", (long long) n->u.l); goto expr;
-  case N_LL: fprintf (f, " %lldll", (long long) n->u.ll); goto expr;
-  case N_U: fprintf (f, " %lluu", (unsigned long long) n->u.ul); goto expr;
-  case N_UL: fprintf (f, " %lluul", (unsigned long long) n->u.ul); goto expr;
-  case N_ULL: fprintf (f, " %lluull", (unsigned long long) n->u.ull); goto expr;
-  case N_F: fprintf (f, " %.*g", FLT_MANT_DIG, (double) n->u.f); goto expr;
-  case N_D: fprintf (f, " %.*g", DBL_MANT_DIG, (double) n->u.d); goto expr;
-  case N_LD: fprintf (f, " %.*Lg", LDBL_MANT_DIG, (long double) n->u.ld); goto expr;
+  case N_IGNORE: output_printf (c2m_ctx, o, "\n"); break;
+  case N_I: output_printf (c2m_ctx, o, " %lld", (long long) n->u.l); goto expr;
+  case N_L: output_printf (c2m_ctx, o, " %lldl", (long long) n->u.l); goto expr;
+  case N_LL: output_printf (c2m_ctx, o, " %lldll", (long long) n->u.ll); goto expr;
+  case N_U: output_printf (c2m_ctx, o, " %lluu", (unsigned long long) n->u.ul); goto expr;
+  case N_UL: output_printf (c2m_ctx, o, " %lluul", (unsigned long long) n->u.ul); goto expr;
+  case N_ULL: output_printf (c2m_ctx, o, " %lluull", (unsigned long long) n->u.ull); goto expr;
+  case N_F: output_printf (c2m_ctx, o, " %.*g", FLT_MANT_DIG, (double) n->u.f); goto expr;
+  case N_D: output_printf (c2m_ctx, o, " %.*g", DBL_MANT_DIG, (double) n->u.d); goto expr;
+  case N_LD: output_printf (c2m_ctx, o, " %.*Lg", LDBL_MANT_DIG, (long double) n->u.ld); goto expr;
   case N_CH:
   case N_CH16:
   case N_CH32:
-    fprintf (f, " %s'", n->code == N_CH ? "" : n->code == N_CH16 ? "u" : "U");
-    print_char (f, n->u.ch);
-    fprintf (f, "'");
+    output_printf (c2m_ctx, o, " %s'", n->code == N_CH ? "" : n->code == N_CH16 ? "u" : "U");
+    print_char (c2m_ctx, o, n->u.ch);
+    output_print (c2m_ctx, o, "'");
     goto expr;
   case N_STR:
   case N_STR16:
   case N_STR32:
-    fprintf (f, " %s\"", n->code == N_STR ? "" : n->code == N_STR16 ? "u" : "U");
+    output_printf (c2m_ctx, o, " %s\"", n->code == N_STR ? "" : n->code == N_STR16 ? "u" : "U");
     (n->code == N_STR     ? print_chars
      : n->code == N_STR16 ? print_chars16
-                          : print_chars32) (f, n->u.s.s, n->u.s.len);
-    fprintf (f, "\"");
+                          : print_chars32) (c2m_ctx, o, n->u.s.s, n->u.s.len);
+    output_printf (c2m_ctx, o, "\"");
     goto expr;
   case N_ID:
-    fprintf (f, " %s", n->u.s.s);
+    output_printf (c2m_ctx, o, " %s", n->u.s.s);
   expr:
-    if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
-    fprintf (f, "\n");
+    if (attr_p && n->attr != NULL) print_expr (c2m_ctx, o, n->attr);
+    output_printf (c2m_ctx, o, "\n");
     break;
   case N_COMMA:
   case N_ANDAND:
@@ -13890,9 +13949,9 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_GENERIC:
   case N_STMTEXPR:
   case N_LABEL_ADDR:
-    if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
-    fprintf (f, "\n");
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    if (attr_p && n->attr != NULL) print_expr (c2m_ctx, o, n->attr);
+    output_print (c2m_ctx, o, "\n");
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_GENERIC_ASSOC:
   case N_IF:
@@ -13939,32 +13998,32 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_TYPE:
   case N_ST_ASSERT:
   case N_ASM:
-    fprintf (f, "\n");
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    output_print (c2m_ctx, o, "\n");
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_ATTR:
-    fprintf (f, "\n");
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    output_printf (c2m_ctx, o, "\n");
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_LIST:
     if (attr_p && n->attr != NULL) {
-      fprintf (f, ": ");
-      print_decl_spec (c2m_ctx, f, (struct decl_spec *) n->attr);
+      output_printf (c2m_ctx, o, ": ");
+      print_decl_spec (c2m_ctx, o, (struct decl_spec *) n->attr);
     }
-    fprintf (f, "\n");
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    output_printf (c2m_ctx, o, "\n");
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_SPEC_DECL:
   case N_MEMBER:
   case N_FUNC_DEF:
-    if (attr_p && n->attr != NULL) print_decl (c2m_ctx, f, (decl_t) n->attr);
-    fprintf (f, "\n");
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    if (attr_p && n->attr != NULL) print_decl (c2m_ctx, o, (decl_t) n->attr);
+    output_printf (c2m_ctx, o, "\n");
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_FUNC:
     if (!attr_p || n->attr == NULL) {
-      fprintf (f, "\n");
-      print_ops (c2m_ctx, f, n, indent, attr_p);
+      output_printf (c2m_ctx, o, "\n");
+      print_ops (c2m_ctx, o, n, indent, attr_p);
       break;
     }
     /* fall through */
@@ -13976,44 +14035,44 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
     if (!attr_p
         || ((n->code == N_STRUCT || n->code == N_UNION)
             && (NL_EL (n->u.ops, 1) == NULL || NL_EL (n->u.ops, 1)->code == N_IGNORE)))
-      fprintf (f, "\n");
+      output_print (c2m_ctx, o, "\n");
     else if (n->code == N_MODULE)
-      fprintf (f, ": the top scope");
+      output_print (c2m_ctx, o, ": the top scope");
     else if (n->attr != NULL)
-      fprintf (f, ": higher scope node %u", ((struct node_scope *) n->attr)->scope->uid);
+      output_printf (c2m_ctx, o, ": higher scope node %u", ((struct node_scope *) n->attr)->scope->uid);
     if (n->code == N_STRUCT || n->code == N_UNION)
-      fprintf (f, "\n");
+      output_print (c2m_ctx, o, "\n");
     else if (attr_p && n->attr != NULL)
-      fprintf (f, ", size = %llu, offset = %llu\n",
+      output_printf (c2m_ctx, o, ", size = %llu, offset = %llu\n",
                (unsigned long long) ((struct node_scope *) n->attr)->size,
                (unsigned long long) ((struct node_scope *) n->attr)->offset);
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_SWITCH:
     if (attr_p && n->attr != NULL) {
-      fprintf (f, ": ");
-      print_type (c2m_ctx, f, &((struct switch_attr *) n->attr)->type);
+      output_printf (c2m_ctx, o, ": ");
+      print_type (c2m_ctx, o, &((struct switch_attr *) n->attr)->type);
     }
-    fprintf (f, "\n");
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    output_printf (c2m_ctx, o, "\n");
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_GOTO:
-    if (attr_p && n->attr != NULL) fprintf (f, ": target node %u\n", ((node_t) n->attr)->uid);
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    if (attr_p && n->attr != NULL) output_printf (c2m_ctx, o, ": target node %u\n", ((node_t) n->attr)->uid);
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
-  case N_INDIRECT_GOTO: print_ops (c2m_ctx, f, n, indent, attr_p); break;
+  case N_INDIRECT_GOTO: print_ops (c2m_ctx, o, n, indent, attr_p); break;
   case N_ENUM:
     if (attr_p && n->attr != NULL) {
-      fprintf (f, ": enum_basic_type = ");
-      print_basic_type (f, ((struct enum_type *) n->attr)->enum_basic_type);
-      fprintf (f, "\n");
+      output_print (c2m_ctx, o, ": enum_basic_type = ");
+      print_basic_type (c2m_ctx, o, ((struct enum_type *) n->attr)->enum_basic_type);
+      output_print (c2m_ctx, o, "\n");
     }
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   case N_ENUM_CONST:
     if (attr_p && n->attr != NULL)  // ???!!!
-      fprintf (f, ": val = %lld\n", (long long) ((struct enum_value *) n->attr)->u.i_val);
-    print_ops (c2m_ctx, f, n, indent, attr_p);
+      output_printf (c2m_ctx, o, ": val = %lld\n", (long long) ((struct enum_value *) n->attr)->u.i_val);
+    print_ops (c2m_ctx, o, n, indent, attr_p);
     break;
   default: abort ();
   }
@@ -14077,8 +14136,8 @@ static int check_id_p (c2m_ctx_t c2m_ctx, const char *str) {
         break;
       }
   }
-  if (!ok_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "macro name %s is not an identifier\n", str);
+  if (!ok_p && c2m_options->message_output != NULL)
+    output_printf (c2m_ctx, c2m_options->message_output, "macro name %s is not an identifier\n", str);
   return ok_p;
 }
 
@@ -14106,8 +14165,8 @@ static void define_cmd_macro (c2m_ctx_t c2m_ctx, const char *name, const char *d
   if (check_id_p (c2m_ctx, id->repr)) {
     macro.id = id;
     if (HTAB_DO (macro_t, macro_tab, &macro, HTAB_FIND, tab_m)) {
-      if (!replacement_eq_p (tab_m->replacement, repl) && c2m_options->message_file != NULL)
-        fprintf (c2m_options->message_file,
+      if (!replacement_eq_p (tab_m->replacement, repl) && c2m_options->message_output != NULL)
+        output_printf (c2m_ctx, c2m_options->message_output,
                  "warning -- redefinition of macro %s on the command line\n", id->repr);
       HTAB_DO (macro_t, macro_tab, &macro, HTAB_DELETE, tab_m);
     }
@@ -14150,6 +14209,7 @@ static void compile_init (c2m_ctx_t c2m_ctx, struct c2mir_options *ops, int (*ge
   c_getc_data = getc_data;
   VARR_CREATE (char, symbol_text, alloc, 128);
   VARR_CREATE (char, temp_string, alloc, 128);
+  VARR_CREATE (char, temp_message_text, alloc, 128);
   VARR_CREATE (pos_t, node_positions, alloc, 128);
   parse_init (c2m_ctx);
   context_init (c2m_ctx);
@@ -14163,6 +14223,7 @@ static void compile_init (c2m_ctx_t c2m_ctx, struct c2mir_options *ops, int (*ge
 static void compile_finish (c2m_ctx_t c2m_ctx) {
   if (symbol_text != NULL) VARR_DESTROY (char, symbol_text);
   if (temp_string != NULL) VARR_DESTROY (char, temp_string);
+  if (temp_message_text != NULL) VARR_DESTROY (char, temp_message_text);
   if (node_positions != NULL) VARR_DESTROY (pos_t, node_positions);
   parse_finish (c2m_ctx);
   context_finish (c2m_ctx);
@@ -14182,8 +14243,18 @@ static const char *get_module_name (c2m_ctx_t c2m_ctx) {
 
 static int top_level_getc (c2m_ctx_t c2m_ctx) { return c_getc (c_getc_data); }
 
-int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *),
-                   void *getc_data, const char *source_name, FILE *output_file) {
+struct c2m_output_writer {
+  c2m_ctx_t c2m_ctx;
+  c2m_output_t o;
+};
+
+static int callback_module_writer(MIR_context_t ctx, void * user_data, uint8_t byte) {
+  struct c2m_output_writer * writer = (struct c2m_output_writer *)user_data;
+  return output_putc(writer->c2m_ctx, writer->o, byte);
+}
+
+int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *), void *getc_data,
+                   const char *source_name, c2m_output_t output) {
   struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
   double start_time = real_usec_time ();
   node_t r;
@@ -14196,58 +14267,72 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
     return 0;
   }
   compile_init (c2m_ctx, ops, getc_func, getc_data);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "C2MIR init end           -- %.0f usec\n",
+  if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+    output_printf (c2m_ctx, c2m_options->message_output, "C2MIR init end           -- %.0f usec\n",
              real_usec_time () - start_time);
   add_stream (c2m_ctx, NULL, source_name, top_level_getc);
   if (!c2m_options->no_prepro_p) add_standard_includes (c2m_ctx);
   pre (c2m_ctx);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "  C2MIR preprocessor end    -- %.0f usec\n",
+  if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+    output_printf (c2m_ctx, c2m_options->message_output, "  C2MIR preprocessor end    -- %.0f usec\n",
              real_usec_time () - start_time);
   if (!c2m_options->prepro_only_p) {
     r = parse (c2m_ctx);
-    if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-      fprintf (c2m_options->message_file, "  C2MIR parser end          -- %.0f usec\n",
+    if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+      output_printf (c2m_ctx, c2m_options->message_output, "  C2MIR parser end          -- %.0f usec\n",
                real_usec_time () - start_time);
-    if (c2m_options->verbose_p && c2m_options->message_file != NULL && n_errors)
-      fprintf (c2m_options->message_file, "parser - FAIL\n");
+    if (c2m_options->verbose_p && c2m_options->message_output != NULL && n_errors)
+      output_printf (c2m_ctx, c2m_options->message_output, "parser - FAIL\n");
     if (!c2m_options->syntax_only_p) {
       n_error_before = n_errors;
       do_context (c2m_ctx, r);
       if (n_errors > n_error_before) {
-        if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, FALSE);
-        if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-          fprintf (c2m_options->message_file, "C2MIR context checker - FAIL\n");
+        if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_output, r, 0, FALSE);
+        if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+          output_printf (c2m_ctx, c2m_options->message_output, "C2MIR context checker - FAIL\n");
       } else {
-        if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, TRUE);
-        if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-          fprintf (c2m_options->message_file, "  C2MIR context checker end -- %.0f usec\n",
+        if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_output, r, 0, TRUE);
+        if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+          output_printf (c2m_ctx, c2m_options->message_output, "  C2MIR context checker end -- %.0f usec\n",
                    real_usec_time () - start_time);
         m = MIR_new_module (ctx, get_module_name (c2m_ctx));
         gen_mir (c2m_ctx, r);
         if ((c2m_options->asm_p || c2m_options->object_p) && n_errors == 0) {
           if (strcmp (source_name, COMMAND_LINE_SOURCE_NAME) == 0) {
-            MIR_output_module (ctx, c2m_options->message_file, m);
-          } else if (output_file != NULL) {
-            (c2m_options->asm_p ? MIR_output_module : MIR_write_module) (ctx, output_file, m);
-            if (ferror (output_file) || fclose (output_file)) {
-              fprintf (c2m_options->message_file, "C2MIR error in writing mir for source file %s\n",
-                       source_name);
-              n_errors++;
+            if (c2m_options->message_output != NULL &&
+                c2m_options->message_output->file != NULL) {
+              MIR_output_module (ctx, c2m_options->message_output->file, m);
+            }
+          } else if (output != NULL) {
+            if (c2m_options->asm_p && output->file != NULL) {
+              MIR_output_module (ctx, output->file, m);
+            } else if(!c2m_options->asm_p) {
+              if (output->file != NULL) {
+                MIR_write_module (ctx, output->file, m);
+                if (ferror (output->file) || fclose (output->file)) {
+                  output_printf (c2m_ctx, c2m_options->message_output, "C2MIR error in writing mir for source file %s\n",
+                           source_name);
+                  n_errors++;
+                }
+              } else if (output->callback) {
+                struct c2m_output_writer w;
+                w.c2m_ctx = c2m_ctx;
+                w.o = output;
+                MIR_write_module_with_func (ctx, callback_module_writer, &w, m);
+              }
             }
           }
         }
         MIR_finish_module (ctx);
-        if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-          fprintf (c2m_options->message_file, "  C2MIR generator end       -- %.0f usec\n",
+        if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+          output_printf (c2m_ctx, c2m_options->message_output, "  C2MIR generator end       -- %.0f usec\n",
                    real_usec_time () - start_time);
       }
     }
   }
   compile_finish (c2m_ctx);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "C2MIR compiler end                -- %.0f usec\n",
+  if (c2m_options->verbose_p && c2m_options->message_output != NULL)
+    output_printf (c2m_ctx, c2m_options->message_output, "C2MIR compiler end                -- %.0f usec\n",
              real_usec_time () - start_time);
   return n_errors == 0;
 }
