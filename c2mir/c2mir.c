@@ -2873,7 +2873,7 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
   macro_t m;
   token_t t, *m_repl;
   VARR (token_t) * arg;
-  int i, m_repl_len, sharp_pos, copy_p;
+  int i, m_repl_len, sharp_pos, copy_p, comma_pos, sharp_sharp_pos;
 
   m = mc->macro;
   sharp_pos = -1;
@@ -2896,6 +2896,7 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
     }
     t = m_repl[mc->repl_pos++];
     copy_p = TRUE;
+
     if (t->code == T_ID) {
       i = find_param (m->params, t->repr);
       if (i >= 0) {
@@ -2911,12 +2912,18 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
             VARR_POP (token_t, arg);
           t = token_stringify (c2m_ctx, mc->macro->id, arg);
           copy_p = FALSE;
+        } else if (sharp_sharp_pos >= 0 && comma_pos >= 0 && sharp_sharp_pos > comma_pos && VARR_LAST (token_t, m->params)->code == T_DOTS && VARR_LENGTH (token_t, arg) == 0) {
+          // Sarah Burns: ,## with empty args is eats the comma
+          del_tokens (mc->repl_buffer, comma_pos, -1);
+          continue;
         } else if ((mc->repl_pos >= 2 && m_repl[mc->repl_pos - 2]->code == T_RDBLNO)
                    || (mc->repl_pos >= 3 && m_repl[mc->repl_pos - 2]->code == ' '
                        && m_repl[mc->repl_pos - 3]->code == T_RDBLNO)
                    || (mc->repl_pos < m_repl_len && m_repl[mc->repl_pos]->code == T_RDBLNO)
                    || (mc->repl_pos + 1 < m_repl_len && m_repl[mc->repl_pos + 1]->code == T_RDBLNO
                        && m_repl[mc->repl_pos]->code == ' ')) {
+          // Sarah Burns - note
+          //   `##THIS` or `## THIS` or `THIS##` or `THIS ##`
           if (VARR_LENGTH (token_t, arg) == 0
               || (VARR_LENGTH (token_t, arg) == 1
                   && (VARR_GET (token_t, arg, 0)->code == ' '
@@ -2940,10 +2947,20 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
           return;
         }
       }
+    } else if (t->code == ',') {
+      comma_pos = (int) VARR_LENGTH (token_t, mc->repl_buffer);
+      sharp_pos = -1;
+      sharp_sharp_pos = -1;
+    } else if (t->code == T_RDBLNO) {
+      sharp_sharp_pos = (int) VARR_LENGTH (token_t, mc->repl_buffer);
+      sharp_pos = -1;
     } else if (t->code == '#') {
       sharp_pos = (int) VARR_LENGTH (token_t, mc->repl_buffer);
+      sharp_sharp_pos = -1;
     } else if (t->code != ' ') {
       sharp_pos = -1;
+      sharp_sharp_pos = -1;
+      comma_pos = -1;
     }
     if (copy_p) t = copy_token (c2m_ctx, t, mc->pos);
     add_token (mc->repl_buffer, t);
