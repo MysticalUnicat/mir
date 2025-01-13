@@ -24,6 +24,12 @@ struct c2m_output {
 
 typedef struct c2m_output *c2m_output_t;
 
+struct c2m_input {
+  int (*getc)(void * user_data);
+  void (*close)(void * user_data);
+  void * user_data;
+};
+
 struct c2mir_options {
   c2m_output_t message_output;
   int debug_p, verbose_p, ignore_warnings_p, no_prepro_p, prepro_only_p;
@@ -37,6 +43,8 @@ struct c2mir_options {
   size_t string_headers_num;
   const char **string_headers_name;
   const char **string_headers_content;
+  int (* progmatic_header)(void *user_data, const char *name, struct c2m_input *input);
+  void * progmatic_header_user_data;
 };
 
 void c2mir_init (MIR_context_t ctx);

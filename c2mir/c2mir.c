@@ -79,6 +79,7 @@ typedef struct stream {
   fpos_t fpos;                    /* file pos to resume file stream */
   const char *start, *curr;       /* non NULL only for string stream  */
   int ifs_length_at_stream_start; /* length of ifs at the stream start */
+  struct c2m_input progmatic_input;
 } *stream_t;
 
 DEF_VARR (stream_t);
@@ -984,6 +985,10 @@ static void init_streams (c2m_ctx_t c2m_ctx) {
 }
 
 static void free_stream (stream_t s) {
+  if (s->progmatic_input.close != NULL) {
+    s->progmatic_input.close(s->progmatic_input.user_data);
+    s->progmatic_input.close = NULL;
+  }
   VARR_DESTROY (char, s->ln);
   free (s);
 }
@@ -1006,6 +1011,9 @@ static stream_t new_stream (MIR_alloc_t alloc, FILE *f, const char *fname, int (
   s->ifs_length_at_stream_start = 0;
   s->start = s->curr = NULL;
   s->getc_func = getc_func;
+  s->progmatic_input.getc = NULL;
+  s->progmatic_input.close = NULL;
+  s->progmatic_input.user_data = NULL;
   return s;
 }
 
@@ -1030,6 +1038,15 @@ static int str_getc (c2m_ctx_t c2m_ctx) {
 static void add_string_stream (c2m_ctx_t c2m_ctx, const char *pos_fname, const char *str) {
   add_stream (c2m_ctx, NULL, pos_fname, str_getc);
   cs->start = cs->curr = str;
+}
+
+static int progmatic_input_getc (c2m_ctx_t c2m_ctx) {
+  return cs->progmatic_input.getc(cs->progmatic_input.user_data);
+}
+
+static void add_progmatic_input_stream (c2m_ctx_t c2m_ctx, const char *pos_fname, const struct c2m_input * input) {
+  add_stream (c2m_ctx, NULL, pos_fname, progmatic_input_getc);
+  cs->progmatic_input = *input;
 }
 
 static int string_stream_p (stream_t s) { return s->getc_func != NULL; }
@@ -1624,6 +1641,12 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
       if (eof_s != cs && cs->f != stdin && cs->f != NULL) {
         fclose (cs->f);
         cs->f = NULL;
+      }
+      if (eof_s != cs && cs->progmatic_input.close != NULL) {
+        cs->progmatic_input.close(cs->progmatic_input.user_data);
+        cs->progmatic_input.getc = NULL;
+        cs->progmatic_input.close = NULL;
+        cs->progmatic_input.user_data = NULL;
       }
       eof_s = VARR_LENGTH (stream_t, streams) == 0 ? NULL : VARR_POP (stream_t, streams);
       if (VARR_LENGTH (stream_t, streams) == 0) {
@@ -2270,7 +2293,7 @@ static void pre_finish (c2m_ctx_t c2m_ctx) {
   free (c2m_ctx->pre_ctx);
 }
 
-static void add_include_stream (c2m_ctx_t c2m_ctx, const char *fname, const char *content,
+static void add_include_stream (c2m_ctx_t c2m_ctx, const char *fname, const char *content, const struct c2m_input * progmatic_input,
                                 pos_t err_pos) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
   FILE *f;
@@ -2278,12 +2301,14 @@ static void add_include_stream (c2m_ctx_t c2m_ctx, const char *fname, const char
   for (size_t i = 0; i < VARR_LENGTH (char_ptr_t, once_include_files); i++)
     if (strcmp (fname, VARR_GET (char_ptr_t, once_include_files, i)) == 0) return;
   assert (fname != NULL);
-  if (content == NULL && (f = fopen (fname, "rb")) == NULL) {
+  if (content == NULL && (progmatic_input == NULL || progmatic_input->getc == NULL) && (f = fopen (fname, "rb")) == NULL) {
     if (c2m_options->message_output != NULL)
       error (c2m_ctx, err_pos, "error in opening file %s", fname);
     longjmp (c2m_ctx->env, 1);  // ???
   }
-  if (content == NULL)
+  if (progmatic_input != NULL && progmatic_input->getc != NULL)
+    add_progmatic_input_stream (c2m_ctx, fname, progmatic_input);
+  else if (content == NULL)
     add_stream (c2m_ctx, f, fname, NULL);
   else
     add_string_stream (c2m_ctx, fname, content);
@@ -2530,10 +2555,12 @@ static const char *get_full_name (c2m_ctx_t c2m_ctx, const char *base, const cha
   return VARR_ADDR (char, temp_string);
 }
 
-static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char **content) {
+static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char **content, struct c2m_input * progmatic_input) {
   const char *fullname, *name;
-
   *content = NULL;
+  progmatic_input->getc = NULL;
+  progmatic_input->close = NULL;
+  progmatic_input->user_data = NULL;
   assert (t->code == T_STR || t->code == T_HEADER);
   if ((name = t->node->u.s.s)[0] != '/') {
     if (t->repr[0] == '"') {
@@ -2547,6 +2574,8 @@ static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char *
         if (file_found_p (fullname)) return uniq_cstr (c2m_ctx, fullname).s;
       }
     }
+    if (c2m_options->progmatic_header != NULL && c2m_options->progmatic_header(c2m_options->progmatic_header_user_data, name, progmatic_input))
+      return name;
     for (size_t i = 0; i < c2m_options->string_headers_num; i++)
       if (c2m_options->string_headers_name[i] != NULL && strcmp (name, c2m_options->string_headers_name[i]) == 0) {
         *content = c2m_options->string_headers_content[i];
@@ -3095,7 +3124,7 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p);
 static struct val eval_expr (c2m_ctx_t c2m_ctx, VARR (token_t) * buffer, token_t if_token);
 
 static const char *get_header_name (c2m_ctx_t c2m_ctx, VARR (token_t) * buffer, pos_t err_pos,
-                                    const char **content) {
+                                    const char **content, struct c2m_input * progmatic_input) {
   size_t i;
 
   *content = NULL;
@@ -3108,7 +3137,7 @@ static const char *get_header_name (c2m_ctx_t c2m_ctx, VARR (token_t) * buffer, 
     error (c2m_ctx, err_pos, "wrong #include");
     return NULL;
   }
-  return get_include_fname (c2m_ctx, VARR_GET (token_t, buffer, i), content);
+  return get_include_fname (c2m_ctx, VARR_GET (token_t, buffer, i), content, progmatic_input);
 }
 
 static void process_directive (c2m_ctx_t c2m_ctx) {
@@ -3213,12 +3242,13 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
     define (c2m_ctx);
   } else if (strcmp (t->repr, "include") == 0) {
     const char *content;
+    struct c2m_input progmatic_input;
 
     t = get_next_include_pptoken (c2m_ctx);
     if (t->code == ' ') t = get_next_include_pptoken (c2m_ctx);
     t1 = get_next_pptoken (c2m_ctx);
     if ((t->code == T_STR || t->code == T_HEADER) && t1->code == '\n')
-      name = get_include_fname (c2m_ctx, t, &content);
+      name = get_include_fname (c2m_ctx, t, &content, &progmatic_input);
     else {
       VARR_PUSH (token_t, temp_buffer, t);
       skip_nl (c2m_ctx, t1, temp_buffer);
@@ -3230,7 +3260,7 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
       processing (c2m_ctx, TRUE);
       no_out_p = FALSE;
       move_tokens (temp_buffer, output_buffer);
-      if ((name = get_header_name (c2m_ctx, temp_buffer, t->pos, &content)) == NULL) {
+      if ((name = get_header_name (c2m_ctx, temp_buffer, t->pos, &content, &progmatic_input)) == NULL) {
         error (c2m_ctx, t->pos, "wrong #include");
         goto ret;
       }
@@ -3239,7 +3269,7 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
       error (c2m_ctx, t->pos, "more %d include levels", VARR_LENGTH (stream_t, streams) - 1);
       goto ret;
     }
-    add_include_stream (c2m_ctx, name, content, t->pos);
+    add_include_stream (c2m_ctx, name, content, &progmatic_input, t->pos);
   } else if (strcmp (t->repr, "line") == 0) {
     skip_nl (c2m_ctx, NULL, temp_buffer);
     unget_next_pptoken (c2m_ctx, new_token (c2m_ctx, t->pos, "", T_EOP, N_IGNORE));
@@ -3804,6 +3834,7 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
         VARR (token_t) * arg;
         const char *name, *content;
         FILE *f;
+        struct c2m_input progmatic_input;
 
         if ((mc = try_param_macro_call (c2m_ctx, m, t)) != NULL) {
           unget_next_pptoken (c2m_ctx, new_token (c2m_ctx, t->pos, "", T_EOR, N_IGNORE));
@@ -3811,8 +3842,14 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
             res = 0;
           } else {
             arg = VARR_LAST (token_arr_t, mc->args);
-            if ((name = get_header_name (c2m_ctx, arg, t->pos, &content)) != NULL) {
-              res = content != NULL || ((f = fopen (name, "r")) != NULL && !fclose (f)) ? 1 : 0;
+            if ((name = get_header_name (c2m_ctx, arg, t->pos, &content, &progmatic_input)) != NULL) {
+              if (progmatic_input.getc != NULL) {
+                if (progmatic_input.close != NULL) {
+                  progmatic_input.close(progmatic_input.user_data);
+                }
+                res = 1;
+              } else
+                res = content != NULL || ((f = fopen (name, "r")) != NULL && !fclose (f)) ? 1 : 0;
             } else {
               error (c2m_ctx, t->pos, "wrong arg of predefined __has_include");
               res = 0;
