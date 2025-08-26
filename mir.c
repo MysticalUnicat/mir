@@ -5084,6 +5084,7 @@ void MIR_write_module_with_func (MIR_context_t ctx, int (*const writer) (MIR_con
   size_t str_len;
 
   io_writer = writer;
+  io_writer_user_data = user_data;
 #ifndef MIR_NO_BIN_COMPRESSION
   if ((io_reduce_data = reduce_encode_start (ctx->alloc, reduce_writer, ctx)) == NULL)
     MIR_get_error_func (ctx) (MIR_binary_io_error, "can not alloc data for MIR binary compression");
